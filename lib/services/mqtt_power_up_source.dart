@@ -13,12 +13,16 @@ class MqttPowerUpSource implements PowerUpSource {
     required this.topic,
     this.port = 1883,
     this.clientId = 'battle_client',
+    this.activeMatchIdProvider,
+    this.requireMatchId = false,
   });
 
   final String broker;
   final String topic;
   final int port;
   final String clientId;
+  final String? Function()? activeMatchIdProvider;
+  final bool requireMatchId;
   final StreamController<PowerUpEvent> _controller =
       StreamController<PowerUpEvent>.broadcast();
   MqttServerClient? _client;
@@ -64,16 +68,29 @@ class MqttPowerUpSource implements PowerUpSource {
   }
 
   PowerUpEvent? _tryParsePowerUp(String payload) {
+    try {
+      final decoded = jsonDecode(payload);
+      if (decoded is Map<String, dynamic> && decoded['powerUp'] is String) {
+        final expectedMatchId = activeMatchIdProvider?.call();
+        final incomingMatchId = decoded['matchId'];
+        if (requireMatchId && expectedMatchId != null) {
+          if (incomingMatchId is! String || incomingMatchId != expectedMatchId) {
+            return null;
+          }
+        }
+        return PowerUpEvent.fromPayload(decoded['powerUp'] as String);
+      }
+    } catch (_) {}
+
+    if (requireMatchId) {
+      return null;
+    }
+
     final simpleEvent = PowerUpEvent.fromPayload(payload);
     if (simpleEvent != null) {
       return simpleEvent;
     }
-    try {
-      final decoded = jsonDecode(payload);
-      if (decoded is Map<String, dynamic> && decoded['powerUp'] is String) {
-        return PowerUpEvent.fromPayload(decoded['powerUp'] as String);
-      }
-    } catch (_) {}
+
     return null;
   }
 

@@ -1,11 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
 
 import '../models/battle_move.dart';
 import '../models/fighter_class.dart';
 import '../models/power_up_event.dart';
+import '../services/ble_power_up_source.dart';
 import '../services/mqtt_power_up_source.dart';
 import '../services/power_up_source.dart';
 import '../widgets/sprite_sheet_actor.dart';
@@ -38,14 +42,23 @@ enum CombatantPose {
   death,
 }
 
-enum CommandMode {
-  root,
-  attacks,
-}
+enum CommandMode { root, attacks }
 
 class _BattleScreenState extends State<BattleScreen> {
-  static const String _mqttBroker = '192.168.1.50';
+  static const String _powerUpTransport = String.fromEnvironment(
+    'POWERUP_TRANSPORT',
+    defaultValue: 'mqtt',
+  );
+
+  static const String _mqttBroker = '172.20.10.6';
   static const String _mqttTopic = 'm5core2/powerups';
+  static const String _mqttMatchTopic = 'm5core2/match';
+  static const String _bleDeviceName = 'EGR425_BLE_Tag_Server';
+  static const String _bleServiceUuid = '4d92ed41-94fc-43a2-a9e6-e17e7f804d02';
+  static const String _blePowerUpNotifyUuid =
+      '99f63e2d-8c68-4206-b763-da326c24009a';
+  static const String _bleMobileReadyWriteUuid =
+      'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
   static const int _maxItems = 3;
 
   static const List<String> _backgrounds = [
@@ -79,6 +92,11 @@ class _BattleScreenState extends State<BattleScreen> {
   int _enemyShield = 0;
   int _healingItems = _maxItems;
 
+  MqttServerClient? _matchClient;
+  bool _isM5Ready = false;
+  Timer? _matchReadyTimeout;
+  late String _matchId;
+
   bool _playerStunned = false;
   bool _enemyStunned = false;
   bool _hasBoost = false;
@@ -97,22 +115,44 @@ class _BattleScreenState extends State<BattleScreen> {
   @override
   void initState() {
     super.initState();
-    _player = fighterClasses.firstWhere((entry) => entry.type == widget.playerClass);
+    _player = fighterClasses.firstWhere(
+      (entry) => entry.type == widget.playerClass,
+    );
     _startNewMatch();
 
-    _powerUpSource = widget.enableHardware
-        ? MqttPowerUpSource(
-            broker: _mqttBroker,
-            topic: _mqttTopic,
-            clientId: 'battle_client_${DateTime.now().millisecondsSinceEpoch}',
-          )
-        : NoopPowerUpSource();
+    if (widget.enableHardware && !_useBleTransport) {
+      _setupMatchListener();
+    }
+
+    if (!widget.enableHardware) {
+      _powerUpSource = NoopPowerUpSource();
+    } else if (_useBleTransport) {
+      _powerUpSource = BlePowerUpSource(
+        serviceUuid: _bleServiceUuid,
+        powerUpNotifyCharacteristicUuid: _blePowerUpNotifyUuid,
+        mobileReadyWriteCharacteristicUuid: _bleMobileReadyWriteUuid,
+        preferredDeviceName: _bleDeviceName,
+        mobileReadyPayload: 'mobileReady:$_matchId',
+      );
+    } else {
+      _powerUpSource = MqttPowerUpSource(
+        broker: _mqttBroker,
+        topic: _mqttTopic,
+        clientId: 'battle_client_${DateTime.now().millisecondsSinceEpoch}',
+        activeMatchIdProvider: () => _matchId,
+        requireMatchId: true,
+      );
+    }
     _setupPowerUps();
   }
+
+  bool get _useBleTransport => _powerUpTransport.toLowerCase() == 'ble';
 
   @override
   void dispose() {
     _powerUpSubscription?.cancel();
+    _matchReadyTimeout?.cancel();
+    _matchClient?.disconnect();
     _powerUpSource.dispose();
     super.dispose();
   }
@@ -122,8 +162,119 @@ class _BattleScreenState extends State<BattleScreen> {
     _powerUpSubscription = _powerUpSource.events.listen(_applyPowerUp);
   }
 
+  Future<void> _setupMatchListener() async {
+    final client = MqttServerClient(
+      _mqttBroker,
+      'match_client_${DateTime.now().millisecondsSinceEpoch}',
+    );
+    client.port = 1883;
+    client.logging(on: false);
+    client.keepAlivePeriod = 20;
+    client.connectTimeoutPeriod = 5000;
+    client.onDisconnected = () {
+      if (mounted) {
+        setState(() {
+          _isM5Ready = false;
+          _status = 'M5 disconnected. Waiting for player...';
+        });
+      }
+      _scheduleMatchReadyTimeout();
+    };
+    final connectMessage = MqttConnectMessage()
+        .withClientIdentifier(
+          'match_client_${DateTime.now().millisecondsSinceEpoch}',
+        )
+        .startClean()
+        .withWillQos(MqttQos.atLeastOnce);
+    client.connectionMessage = connectMessage;
+
+    try {
+      await client.connect();
+      if (client.connectionStatus?.state == MqttConnectionState.connected) {
+        _matchClient = client;
+        client.subscribe(_mqttMatchTopic, MqttQos.atLeastOnce);
+        client.updates?.listen(_handleMatchMessages);
+
+        _publishMobileReady();
+        _scheduleMatchReadyTimeout();
+      }
+    } catch (_) {
+      client.disconnect();
+      if (mounted) {
+        setState(() {
+          _status = 'Failed to connect to match topic. Retry...';
+        });
+      }
+    }
+  }
+
+  void _scheduleMatchReadyTimeout() {
+    _matchReadyTimeout?.cancel();
+    _matchReadyTimeout = Timer(const Duration(seconds: 15), () {
+      if (!mounted || _isM5Ready) return;
+      setState(() {
+        _status = 'Waiting for M5Core2 player to join...';
+      });
+      _publishMobileReady();
+      _scheduleMatchReadyTimeout();
+    });
+  }
+
+  void _handleMatchMessages(List<MqttReceivedMessage<MqttMessage>> messages) {
+    for (final message in messages) {
+      final payload = MqttPublishPayload.bytesToStringAsString(
+        (message.payload as MqttPublishMessage).payload.message,
+      );
+      try {
+        final decoded = jsonDecode(payload);
+        if (decoded is Map<String, dynamic> &&
+            decoded['type'] == 'm5Ready' &&
+            decoded['matchId'] == _matchId) {
+          if (mounted) {
+            setState(() {
+              _isM5Ready = true;
+              _status = 'M5Core2 player connected! Battle begins.';
+            });
+          }
+          _matchReadyTimeout?.cancel();
+        }
+      } catch (_) {
+        // ignore malformed match messages
+      }
+    }
+  }
+
+  Future<void> _publishMobileReady() async {
+    if (_matchClient == null ||
+        _matchClient?.connectionStatus?.state !=
+            MqttConnectionState.connected) {
+      return;
+    }
+
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(
+      jsonEncode({
+        'type': 'mobileReady',
+        'matchId': _matchId,
+        'player': 'mobile',
+        'timestamp': DateTime.now().toIso8601String(),
+      }),
+    );
+
+    _matchClient?.publishMessage(
+      _mqttMatchTopic,
+      MqttQos.atLeastOnce,
+      builder.payload!,
+    );
+  }
+
   void _startNewMatch() {
-    final enemies = fighterClasses.where((entry) => entry.type != _player.type).toList();
+    _matchId = _buildMatchId();
+    _isM5Ready = !widget.enableHardware || _useBleTransport;
+
+    final enemies = fighterClasses
+        .where((entry) => entry.type != _player.type)
+        .toList();
 
     _enemy = enemies[_random.nextInt(enemies.length)];
     _backgroundAsset = _backgrounds[_random.nextInt(_backgrounds.length)];
@@ -143,12 +294,28 @@ class _BattleScreenState extends State<BattleScreen> {
     _commandMode = CommandMode.root;
     _showCenterVfx = false;
     _centerVfxAsset = null;
-    _status = '${_player.displayName} vs ${_enemy.displayName}! Choose your action.';
+    _status =
+        '${_player.displayName} vs ${_enemy.displayName}! Choose your action.';
+    if (!_isM5Ready) {
+      _status = 'Waiting for M5Core2 player to connect...';
+    }
+
+    if (widget.enableHardware && !_useBleTransport) {
+      _publishMobileReady();
+      _scheduleMatchReadyTimeout();
+    }
+  }
+
+  String _buildMatchId() {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final salt = _random.nextInt(0x100000).toRadixString(16).padLeft(5, '0');
+    return 'match_$timestamp$salt';
   }
 
   bool get _isBattleOver => _playerHp <= 0 || _enemyHp <= 0;
 
-  bool get _canPlayerAct => _playerTurn && !_isBattleOver && !_isAnimating;
+  bool get _canPlayerAct =>
+      _playerTurn && !_isBattleOver && !_isAnimating && _isM5Ready;
 
   void _applyPowerUp(PowerUpEvent event) {
     if (!mounted || _isBattleOver) {
@@ -248,7 +415,9 @@ class _BattleScreenState extends State<BattleScreen> {
       case FighterClass.knight:
         return null;
       case FighterClass.monk:
-        return move.name == 'Cyclone Kick' ? null : 'assets/Monk/spr_fireball_charge.png';
+        return move.name == 'Cyclone Kick'
+            ? null
+            : 'assets/Monk/spr_fireball_charge.png';
       case FighterClass.ninja:
         return move.name == 'Kunai Toss' ? 'assets/Ninja/spr_kunai.png' : null;
       case FighterClass.wizard:
@@ -322,14 +491,14 @@ class _BattleScreenState extends State<BattleScreen> {
         _playerPose = _playerHp <= 0
             ? CombatantPose.death
             : _playerStunned
-                ? CombatantPose.stunned
-                : CombatantPose.hit;
+            ? CombatantPose.stunned
+            : CombatantPose.hit;
       } else {
         _enemyPose = _enemyHp <= 0
             ? CombatantPose.death
             : _enemyStunned
-                ? CombatantPose.stunned
-                : CombatantPose.hit;
+            ? CombatantPose.stunned
+            : CombatantPose.hit;
       }
     });
 
@@ -345,14 +514,19 @@ class _BattleScreenState extends State<BattleScreen> {
 
     setState(() {
       if (isPlayer) {
-        _playerPose = _playerStunned ? CombatantPose.stunned : CombatantPose.idle;
+        _playerPose = _playerStunned
+            ? CombatantPose.stunned
+            : CombatantPose.idle;
       } else {
         _enemyPose = _enemyStunned ? CombatantPose.stunned : CombatantPose.idle;
       }
     });
   }
 
-  Future<_ResolvedMove> _resolveMove(BattleMove move, int defendingShield) async {
+  Future<_ResolvedMove> _resolveMove(
+    BattleMove move,
+    int defendingShield,
+  ) async {
     var damage = move.rollDamage(_random);
     var heal = 0;
     var shieldGain = 0;
@@ -425,13 +599,18 @@ class _BattleScreenState extends State<BattleScreen> {
     });
 
     final isRanged =
-        move.name.contains('Toss') || move.name.contains('Bolt') || move.name.contains('Fireball');
+        move.name.contains('Toss') ||
+        move.name.contains('Bolt') ||
+        move.name.contains('Fireball');
 
     await _playAttackPose(isPlayer: true, isRanged: isRanged);
 
     final projectileAsset = _projectileForMove(_player, move);
     if (projectileAsset != null) {
-      await _playCenterVfx(projectileAsset, duration: const Duration(milliseconds: 220));
+      await _playCenterVfx(
+        projectileAsset,
+        duration: const Duration(milliseconds: 220),
+      );
     }
 
     final resolved = await _resolveMove(move, _enemyShield);
@@ -500,13 +679,18 @@ class _BattleScreenState extends State<BattleScreen> {
 
     final move = _enemy.moves[_random.nextInt(_enemy.moves.length)];
     final isRanged =
-        move.name.contains('Toss') || move.name.contains('Bolt') || move.name.contains('Fireball');
+        move.name.contains('Toss') ||
+        move.name.contains('Bolt') ||
+        move.name.contains('Fireball');
 
     await _playAttackPose(isPlayer: false, isRanged: isRanged);
 
     final projectileAsset = _projectileForMove(_enemy, move);
     if (projectileAsset != null) {
-      await _playCenterVfx(projectileAsset, duration: const Duration(milliseconds: 220));
+      await _playCenterVfx(
+        projectileAsset,
+        duration: const Duration(milliseconds: 220),
+      );
     }
 
     final resolved = await _resolveMove(move, _playerShield);
@@ -564,7 +748,8 @@ class _BattleScreenState extends State<BattleScreen> {
       _healingItems -= 1;
       _playerHp = min(_player.maxHp, _playerHp + 25);
       _playerTurn = false;
-      _status = '${_player.displayName} used Potion (+25 HP). Items left: $_healingItems';
+      _status =
+          '${_player.displayName} used Potion (+25 HP). Items left: $_healingItems';
     });
 
     Future<void>.delayed(const Duration(milliseconds: 500), () {
@@ -598,7 +783,9 @@ class _BattleScreenState extends State<BattleScreen> {
         borderRadius: BorderRadius.circular(6),
       ),
       child: Column(
-        crossAxisAlignment: alignRight ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        crossAxisAlignment: alignRight
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
@@ -686,7 +873,9 @@ class _BattleScreenState extends State<BattleScreen> {
                       rowButton(
                         'Attacks',
                         _canPlayerAct
-                            ? () => setState(() => _commandMode = CommandMode.attacks)
+                            ? () => setState(
+                                () => _commandMode = CommandMode.attacks,
+                              )
                             : null,
                       ),
                       SizedBox(width: gap),
@@ -701,19 +890,20 @@ class _BattleScreenState extends State<BattleScreen> {
                 Expanded(
                   child: Row(
                     children: [
-                      rowButton('M5 Powerup', _canPlayerAct ? _triggerM5PowerUp : null),
-                      SizedBox(width: gap),
                       rowButton(
-                        'Run',
-                        () {
-                          Navigator.of(context).pushReplacement(
-                            MaterialPageRoute<void>(
-                              builder: (_) =>
-                                  CharacterSelectScreen(enableHardware: widget.enableHardware),
-                            ),
-                          );
-                        },
+                        'M5 Powerup',
+                        _canPlayerAct ? _triggerM5PowerUp : null,
                       ),
+                      SizedBox(width: gap),
+                      rowButton('Run', () {
+                        Navigator.of(context).pushReplacement(
+                          MaterialPageRoute<void>(
+                            builder: (_) => CharacterSelectScreen(
+                              enableHardware: widget.enableHardware,
+                            ),
+                          ),
+                        );
+                      }),
                     ],
                   ),
                 ),
@@ -752,7 +942,10 @@ class _BattleScreenState extends State<BattleScreen> {
                     children: [
                       moveButtons[2],
                       SizedBox(width: gap),
-                      rowButton('Back', () => setState(() => _commandMode = CommandMode.root)),
+                      rowButton(
+                        'Back',
+                        () => setState(() => _commandMode = CommandMode.root),
+                      ),
                     ],
                   ),
                 ),
@@ -774,7 +967,9 @@ class _BattleScreenState extends State<BattleScreen> {
               ),
               SizedBox(height: gap),
               Expanded(
-                child: _commandMode == CommandMode.root ? rootLayout() : attacksLayout(),
+                child: _commandMode == CommandMode.root
+                    ? rootLayout()
+                    : attacksLayout(),
               ),
             ],
           );
@@ -804,7 +999,8 @@ class _BattleScreenState extends State<BattleScreen> {
                   ? constraints.maxHeight * 0.32
                   : constraints.maxHeight * 0.2;
 
-              final battlefieldBottom = commandPanelHeight + (isLandscape ? 6 : 14);
+              final battlefieldBottom =
+                  commandPanelHeight + (isLandscape ? 6 : 14);
 
               return Stack(
                 fit: StackFit.expand,
@@ -844,12 +1040,16 @@ class _BattleScreenState extends State<BattleScreen> {
                         ),
 
                         Positioned(
-                          left: constraints.maxWidth * (isLandscape ? 0.08 : 0.03),
+                          left:
+                              constraints.maxWidth *
+                              (isLandscape ? 0.08 : 0.03),
                           bottom: battlefieldBottom,
                           child: SpriteSheetActor(
                             assetPath: _spriteForPose(_player, _playerPose),
                             animationKey: 'player_${_playerPose.name}',
-                            width: constraints.maxWidth * (isLandscape ? 0.32 : 0.45),
+                            width:
+                                constraints.maxWidth *
+                                (isLandscape ? 0.32 : 0.45),
                             height: playerSpriteHeight,
                             stepTime: _stepTimeForPose(_playerPose),
                             loop: _isLoopingPose(_playerPose),
@@ -858,12 +1058,16 @@ class _BattleScreenState extends State<BattleScreen> {
                         ),
 
                         Positioned(
-                          right: constraints.maxWidth * (isLandscape ? 0.12 : 0.06),
+                          right:
+                              constraints.maxWidth *
+                              (isLandscape ? 0.12 : 0.06),
                           bottom: battlefieldBottom + (isLandscape ? 76 : 84),
                           child: SpriteSheetActor(
                             assetPath: _spriteForPose(_enemy, _enemyPose),
                             animationKey: 'enemy_${_enemyPose.name}',
-                            width: constraints.maxWidth * (isLandscape ? 0.27 : 0.36),
+                            width:
+                                constraints.maxWidth *
+                                (isLandscape ? 0.27 : 0.36),
                             height: enemySpriteHeight,
                             stepTime: _stepTimeForPose(_enemyPose),
                             flipX: true,
@@ -885,7 +1089,10 @@ class _BattleScreenState extends State<BattleScreen> {
                             top: 8,
                             right: 10,
                             child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
                               color: Colors.black.withValues(alpha: 0.45),
                               child: const Text(
                                 'Best in landscape',
@@ -896,6 +1103,46 @@ class _BattleScreenState extends State<BattleScreen> {
                       ],
                     ),
                   ),
+
+                  if (!_isM5Ready)
+                    Container(
+                      color: Colors.black.withValues(alpha: 0.6),
+                      alignment: Alignment.center,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const CircularProgressIndicator(color: Colors.white),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Waiting for M5Core2 player to connect...',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            _status,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Match ID: $_matchId',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
 
                   IgnorePointer(
                     child: Center(

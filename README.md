@@ -1,22 +1,63 @@
-<<<<<<< HEAD
-# legally_distinct_pokemon_battle
-
-A new Flutter project.
-
-## Getting Started
-
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-=======
 # LegallyDistinctPokemonBattle
 
-This is a game played between a player on a flutter app and a player on a core 2 M5. The basic idea is that the mobile app player is going to control a character, and the goal is to beat the opponent. 
-The player will choose between a couple of different actions they can do on thier turn, and then the enemy will take a turn. We will either have it so the Core 2 player will either select every action for the AI to take,
-or have it so they choose which enemy goes in at which point, or, what powerups they can apply to their enemies. We will mess around with this to see how it goes. 
->>>>>>> b5ed6b345258d89273d5d8a3d3d92afb8d21f2a4
+A multiplayer battle prototype where:
+- Mobile (Flutter) controls fighter actions
+- M5 Core2 controls powerups
+
+The game now uses match-scoped MQTT handshakes so each battle instance waits for an M5 Core2 player to join that exact match.
+
+This repo also includes an alternative BLE transport that mirrors the same client/server workflow from your working sample.
+
+## MQTT topics
+- `m5core2/match`
+- `m5core2/powerups`
+
+## Match handshake flow
+1. Mobile enters battle and generates a `matchId`.
+2. Mobile publishes:
+```json
+{"type":"mobileReady","matchId":"match_...","player":"mobile"}
+```
+3. M5 listens for `mobileReady`, adopts that `matchId`, and responds:
+```json
+{"type":"m5Ready","matchId":"match_...","player":"m5core2"}
+```
+4. Mobile begins gameplay only after receiving `m5Ready` for the same `matchId`.
+5. M5 powerups are published as:
+```json
+{"type":"powerUp","matchId":"match_...","powerUp":"heal|shield|boost","player":"m5core2"}
+```
+
+The Flutter app ignores powerups that do not match the active `matchId`.
+
+## Mobile setup
+1. Install Flutter dependencies:
+```bash
+flutter pub get
+```
+2. Set broker IP in [battle_screen.dart](/Users/gracebergquist/Repos/LegallyDistinctPokemonBattle/lib/screens/battle_screen.dart).
+3. Run app:
+```bash
+flutter run
+```
+
+## Mobile BLE mode (optional)
+Run with:
+```bash
+flutter run --dart-define=POWERUP_TRANSPORT=ble
+```
+
+The BLE transport listens for power-up notifications from an M5 BLE server named `EGR425_BLE_Tag_Server`.
+
+## M5 Core2 setup
+Firmware lives at:
+- [m5core2_powerups.ino](/Users/gracebergquist/Repos/LegallyDistinctPokemonBattle/firmware/m5core2_powerups/m5core2_powerups.ino)
+- [firmware README](/Users/gracebergquist/Repos/LegallyDistinctPokemonBattle/firmware/m5core2_powerups/README.md)
+
+Follow that firmware README to configure WiFi, broker, and flash the board.
+
+## M5 Core2 BLE firmware (optional)
+Alternative BLE firmware lives at:
+- [BLE firmware README](/Users/gracebergquist/Repos/LegallyDistinctPokemonBattle/firmware/m5core2_ble_powerups/README.md)
+
+Use that when you want local BLE client/server instead of MQTT.

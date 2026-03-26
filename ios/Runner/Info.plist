@@ -4,6 +4,10 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>This app uses Bluetooth to connect to the M5 Core2 power-up controller.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>This app uses Bluetooth to connect to the M5 Core2 power-up controller.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
