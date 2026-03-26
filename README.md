@@ -4,6 +4,10 @@ A multiplayer battle prototype where:
 - Mobile (Flutter) controls fighter actions
 - M5 Core2 controls powerups
 
+At boot, Flutter now shows a mode menu:
+- `Same Team`: existing co-op style (Flutter attacks, M5 assists)
+- `PvP`: Flutter vs M5 mash duel mode
+
 The game now uses match-scoped MQTT handshakes so each battle instance waits for an M5 Core2 player to join that exact match.
 
 This repo also includes an alternative BLE transport that mirrors the same client/server workflow from your working sample.
@@ -51,6 +55,12 @@ The BLE transport runs M5 challenge phases from an M5 BLE server named `EGR425_B
 - `READY` (1 second)
 - `GO!` (4 seconds of A/B/C mashing)
 - Flutter uses press count for attack bonus or defense block
+
+In PvP mode:
+- Flutter still chooses the move.
+- Each turn runs a 4-second mash duel.
+- Attacker mash increases damage; defender mash reduces it.
+- Turns alternate until one side is defeated.
 
 ## M5 Core2 setup
 Firmware lives at:

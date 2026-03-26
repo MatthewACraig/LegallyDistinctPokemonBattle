@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/fighter_class.dart';
+import '../models/game_mode.dart';
 import '../widgets/sprite_sheet_actor.dart';
 import 'battle_screen.dart';
 
@@ -8,9 +9,11 @@ class CharacterSelectScreen extends StatelessWidget {
   const CharacterSelectScreen({
     super.key,
     required this.enableHardware,
+    required this.gameMode,
   });
 
   final bool enableHardware;
+  final GameMode gameMode;
 
   @override
   Widget build(BuildContext context) {
@@ -46,6 +49,7 @@ class CharacterSelectScreen extends StatelessWidget {
                           builder: (_) => BattleScreen(
                             enableHardware: enableHardware,
                             playerClass: fighter.type,
+                            gameMode: gameMode,
                           ),
                         ),
                       );
@@ -62,10 +66,7 @@ class CharacterSelectScreen extends StatelessWidget {
 }
 
 class _CharacterCard extends StatelessWidget {
-  const _CharacterCard({
-    required this.fighter,
-    required this.onSelect,
-  });
+  const _CharacterCard({required this.fighter, required this.onSelect});
 
   final FighterClassData fighter;
   final VoidCallback onSelect;
@@ -95,10 +96,7 @@ class _CharacterCard extends StatelessWidget {
               style: Theme.of(context).textTheme.titleMedium,
               textAlign: TextAlign.center,
             ),
-            Text(
-              'HP: ${fighter.maxHp}',
-              textAlign: TextAlign.center,
-            ),
+            Text('HP: ${fighter.maxHp}', textAlign: TextAlign.center),
             const SizedBox(height: 8),
             FilledButton(
               onPressed: onSelect,

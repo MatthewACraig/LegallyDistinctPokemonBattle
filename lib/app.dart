@@ -1,12 +1,9 @@
 import 'package:flutter/material.dart';
 
-import 'screens/character_select_screen.dart';
+import 'screens/game_mode_screen.dart';
 
 class BattleGameApp extends StatelessWidget {
-  const BattleGameApp({
-    super.key,
-    this.enableHardware = true,
-  });
+  const BattleGameApp({super.key, this.enableHardware = true});
 
   final bool enableHardware;
 
@@ -17,7 +14,7 @@ class BattleGameApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
       ),
-      home: CharacterSelectScreen(enableHardware: enableHardware),
+      home: GameModeScreen(enableHardware: enableHardware),
     );
   }
 }

@@ -8,6 +8,7 @@ import 'package:mqtt_client/mqtt_server_client.dart';
 
 import '../models/battle_move.dart';
 import '../models/fighter_class.dart';
+import '../models/game_mode.dart';
 import '../services/ble_power_up_source.dart';
 import '../services/mqtt_power_up_source.dart';
 import '../services/power_up_source.dart';
@@ -19,10 +20,12 @@ class BattleScreen extends StatefulWidget {
     super.key,
     this.enableHardware = true,
     required this.playerClass,
+    required this.gameMode,
   });
 
   final bool enableHardware;
   final FighterClass playerClass;
+  final GameMode gameMode;
 
   @override
   State<BattleScreen> createState() => _BattleScreenState();
@@ -106,6 +109,21 @@ class _BattleScreenState extends State<BattleScreen> {
   String _backgroundAsset = _backgrounds.first;
   String? _centerVfxAsset;
   bool _showCenterVfx = false;
+  bool _showQte = false;
+  double _qteProgress = 0;
+  Timer? _qteTimer;
+  Completer<bool>? _qteCompleter;
+  bool _showMashOverlay = false;
+  bool _mashGo = false;
+  int _mashPressCount = 0;
+  double _mashTimeLeftSeconds = 0;
+  String _mashLabel = '';
+  Timer? _mashTimer;
+  Completer<int>? _mashCompleter;
+
+  static const double _qteZoneStart = 0.42;
+  static const double _qteZoneEnd = 0.58;
+  static const double _qteSuccessMultiplier = 1.75;
 
   CommandMode _commandMode = CommandMode.root;
   CombatantPose _playerPose = CombatantPose.idle;
@@ -148,9 +166,18 @@ class _BattleScreenState extends State<BattleScreen> {
   }
 
   bool get _useBleTransport => _powerUpTransport.toLowerCase() == 'ble';
+  bool get _isPvpMode => widget.gameMode == GameMode.pvp;
 
   @override
   void dispose() {
+    _qteTimer?.cancel();
+    if (_qteCompleter != null && !_qteCompleter!.isCompleted) {
+      _qteCompleter!.complete(false);
+    }
+    _mashTimer?.cancel();
+    if (_mashCompleter != null && !_mashCompleter!.isCompleted) {
+      _mashCompleter!.complete(0);
+    }
     _matchReadyTimeout?.cancel();
     _matchClient?.disconnect();
     _powerUpSource.dispose();
@@ -293,8 +320,9 @@ class _BattleScreenState extends State<BattleScreen> {
     _commandMode = CommandMode.root;
     _showCenterVfx = false;
     _centerVfxAsset = null;
-    _status =
-        '${_player.displayName} vs ${_enemy.displayName}! Choose your action.';
+    _status = _isPvpMode
+        ? '${_player.displayName} vs M5 (${_enemy.displayName})! Choose attack.'
+        : '${_player.displayName} vs ${_enemy.displayName}! Choose your action.';
     if (!_isM5Ready) {
       _status = 'Waiting for M5Core2 player to connect...';
     }
@@ -334,6 +362,155 @@ class _BattleScreenState extends State<BattleScreen> {
     });
 
     return _blePowerUpSource!.runChallenge(matchId: _matchId, phase: phase);
+  }
+
+  Future<bool> _runTapTimingQte({
+    Duration duration = const Duration(seconds: 4),
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+
+    _qteTimer?.cancel();
+    if (_qteCompleter != null && !_qteCompleter!.isCompleted) {
+      _qteCompleter!.complete(false);
+    }
+
+    final completer = Completer<bool>();
+    _qteCompleter = completer;
+    final started = DateTime.now();
+    final totalMs = duration.inMilliseconds;
+
+    setState(() {
+      _showQte = true;
+      _qteProgress = 0;
+    });
+
+    _qteTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+        return;
+      }
+
+      final elapsedMs = DateTime.now().difference(started).inMilliseconds;
+      final next = (elapsedMs / totalMs).clamp(0.0, 1.0);
+      setState(() {
+        _qteProgress = next;
+      });
+
+      if (elapsedMs >= totalMs) {
+        timer.cancel();
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+      }
+    });
+
+    final result = await completer.future;
+    _qteTimer?.cancel();
+    _qteTimer = null;
+
+    if (mounted) {
+      setState(() {
+        _showQte = false;
+      });
+    }
+
+    return result;
+  }
+
+  void _tapQteNow() {
+    final completer = _qteCompleter;
+    if (!_showQte || completer == null || completer.isCompleted) {
+      return;
+    }
+
+    final success =
+        _qteProgress >= _qteZoneStart && _qteProgress <= _qteZoneEnd;
+    completer.complete(success);
+  }
+
+  Future<int> _runFlutterMashChallenge({
+    required String label,
+    Duration readyDuration = const Duration(seconds: 1),
+    Duration goDuration = const Duration(seconds: 4),
+  }) async {
+    if (!mounted) {
+      return 0;
+    }
+
+    _mashTimer?.cancel();
+    if (_mashCompleter != null && !_mashCompleter!.isCompleted) {
+      _mashCompleter!.complete(0);
+    }
+
+    final completer = Completer<int>();
+    _mashCompleter = completer;
+    final readyMs = readyDuration.inMilliseconds;
+    final goMs = goDuration.inMilliseconds;
+    final started = DateTime.now();
+
+    setState(() {
+      _showMashOverlay = true;
+      _mashGo = false;
+      _mashLabel = label;
+      _mashPressCount = 0;
+      _mashTimeLeftSeconds = goDuration.inMilliseconds / 1000;
+    });
+
+    _mashTimer = Timer.periodic(const Duration(milliseconds: 33), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        if (!completer.isCompleted) {
+          completer.complete(0);
+        }
+        return;
+      }
+
+      final elapsed = DateTime.now().difference(started).inMilliseconds;
+      if (elapsed < readyMs) {
+        return;
+      }
+
+      final elapsedGo = elapsed - readyMs;
+      final remainingMs = max(0, goMs - elapsedGo);
+
+      setState(() {
+        _mashGo = true;
+        _mashTimeLeftSeconds = remainingMs / 1000.0;
+      });
+
+      if (elapsedGo >= goMs) {
+        timer.cancel();
+        if (!completer.isCompleted) {
+          completer.complete(_mashPressCount);
+        }
+      }
+    });
+
+    final count = await completer.future;
+    _mashTimer?.cancel();
+    _mashTimer = null;
+
+    if (mounted) {
+      setState(() {
+        _showMashOverlay = false;
+      });
+    }
+
+    return count;
+  }
+
+  void _tapMashNow() {
+    if (!_showMashOverlay || !_mashGo) {
+      return;
+    }
+    setState(() {
+      _mashPressCount += 1;
+    });
   }
 
   String _pickImpactVfx() => _impactVfx[_random.nextInt(_impactVfx.length)];
@@ -612,34 +789,78 @@ class _BattleScreenState extends State<BattleScreen> {
       );
     }
 
-    final mashCount = await _runM5MashChallenge(
-      phase: 'attack',
-      contextName: move.name,
-    );
-    final resolved = await _resolveMove(move, _enemyShield);
+    late final int totalDamage;
+    late final String extraStatus;
+    late final int enemyShieldNext;
+    late final bool enemyStunnedNext;
+    late final int playerHpNext;
+    late final int playerShieldNext;
     final boost = _hasBoost ? 8 : 0;
-    final m5Bonus = _attackBonusFromPresses(mashCount);
-    final totalDamage = resolved.damage + boost + m5Bonus;
 
-    setState(() {
-      _enemyShield = max(0, _enemyShield - resolved.blocked);
-      _enemyHp = max(0, _enemyHp - totalDamage);
-      _enemyStunned = resolved.stunned;
-      _playerHp = min(_player.maxHp, _playerHp + resolved.heal);
-      _playerShield += resolved.shieldGain;
-      _hasBoost = false;
-      _playerTurn = false;
+    if (_isPvpMode) {
+      final results = await Future.wait<int>([
+        _runFlutterMashChallenge(label: 'ATTACK! Mash to deal damage'),
+        _runM5MashChallenge(phase: 'defense', contextName: move.name),
+      ]);
+      final flutterAttackPresses = results[0];
+      final m5BlockPresses = results[1];
 
-      _status =
-          '${_player.displayName} used ${move.name}! '
-          '$totalDamage dmg'
+      final resolved = await _resolveMove(move, 0);
+      final flutterAttackBonus = _attackBonusFromPresses(flutterAttackPresses);
+      final m5Block = _defenseBlockFromPresses(m5BlockPresses);
+      final rawDamage = resolved.damage + boost + flutterAttackBonus;
+      totalDamage = max(0, rawDamage - m5Block);
+      enemyShieldNext = _enemyShield;
+      enemyStunnedNext = resolved.stunned;
+      playerHpNext = min(_player.maxHp, _playerHp + resolved.heal);
+      playerShieldNext = _playerShield + resolved.shieldGain;
+
+      extraStatus =
+          ' [Flutter mash:$flutterAttackPresses => +$flutterAttackBonus, M5 block:$m5BlockPresses => -$m5Block]';
+    } else {
+      final mashFuture = _runM5MashChallenge(
+        phase: 'attack',
+        contextName: move.name,
+      );
+      final qteFuture = _runTapTimingQte();
+      final mashCount = await mashFuture;
+      final qteSuccess = await qteFuture;
+      final resolved = await _resolveMove(move, _enemyShield);
+      final m5Bonus = _attackBonusFromPresses(mashCount);
+      final m5FinalBonus = qteSuccess
+          ? (m5Bonus * _qteSuccessMultiplier).round()
+          : m5Bonus;
+      totalDamage = resolved.damage + boost + m5FinalBonus;
+      enemyShieldNext = max(0, _enemyShield - resolved.blocked);
+      enemyStunnedNext = resolved.stunned;
+      playerHpNext = min(_player.maxHp, _playerHp + resolved.heal);
+      playerShieldNext = _playerShield + resolved.shieldGain;
+
+      extraStatus =
           '${resolved.blocked > 0 ? ' (${resolved.blocked} blocked)' : ''}'
           '${resolved.critical ? ' [CRIT]' : ''}'
           '${resolved.doubleStrike ? ' [DOUBLE]' : ''}'
           '${resolved.heal > 0 ? ' +${resolved.heal} HP' : ''}'
           '${resolved.shieldGain > 0 ? ' +${resolved.shieldGain} shield' : ''}'
           '${resolved.stunned ? ' and stunned ${_enemy.displayName}!' : ''}'
-          '${m5Bonus > 0 ? ' [M5 +$m5Bonus from $mashCount presses]' : ''}';
+          '${m5Bonus > 0 ? ' [M5 +$m5FinalBonus from $mashCount presses]' : ''}'
+          '${qteSuccess && m5Bonus > 0 ? ' [QTE x$_qteSuccessMultiplier]' : ''}'
+          '${!qteSuccess ? ' [QTE miss]' : ''}';
+    }
+
+    setState(() {
+      _enemyShield = enemyShieldNext;
+      _enemyHp = max(0, _enemyHp - totalDamage);
+      _enemyStunned = enemyStunnedNext;
+      _playerHp = playerHpNext;
+      _playerShield = playerShieldNext;
+      _hasBoost = false;
+      _playerTurn = false;
+
+      _status =
+          '${_player.displayName} used ${move.name}! '
+          '$totalDamage dmg'
+          '$extraStatus';
     });
 
     await _playCenterVfx(_impactForMove(_player, move));
@@ -698,24 +919,49 @@ class _BattleScreenState extends State<BattleScreen> {
       );
     }
 
-    final mashCount = await _runM5MashChallenge(
-      phase: 'defense',
-      contextName: move.name,
-    );
-    final resolved = await _resolveMove(move, _playerShield);
-    final m5Block = _defenseBlockFromPresses(mashCount);
-    final postMashDamage = max(0, resolved.damage - m5Block);
+    late final int postMashDamage;
+    late final String enemyTurnStatus;
+    late final bool playerStunnedNext;
+    late final int enemyHpNext;
+    late final int enemyShieldNext;
+    late final int playerShieldNext;
 
-    setState(() {
-      _playerShield = max(0, _playerShield - resolved.blocked);
-      _playerHp = max(0, _playerHp - postMashDamage);
-      _playerStunned = resolved.stunned;
-      _enemyHp = min(_enemy.maxHp, _enemyHp + resolved.heal);
-      _enemyShield += resolved.shieldGain;
-      _playerTurn = true;
-      _isAnimating = false;
+    if (_isPvpMode) {
+      final results = await Future.wait<int>([
+        _runM5MashChallenge(phase: 'attack', contextName: move.name),
+        _runFlutterMashChallenge(label: 'DEFEND! Mash to block'),
+      ]);
+      final m5AttackPresses = results[0];
+      final flutterBlockPresses = results[1];
+      final resolved = await _resolveMove(move, 0);
+      final m5AttackBonus = _attackBonusFromPresses(m5AttackPresses);
+      final flutterBlock = _defenseBlockFromPresses(flutterBlockPresses);
+      final rawDamage = resolved.damage + m5AttackBonus;
+      postMashDamage = max(0, rawDamage - flutterBlock);
 
-      _status =
+      playerStunnedNext = resolved.stunned;
+      enemyHpNext = min(_enemy.maxHp, _enemyHp + resolved.heal);
+      enemyShieldNext = _enemyShield + resolved.shieldGain;
+      playerShieldNext = _playerShield;
+      enemyTurnStatus =
+          '${_enemy.displayName} used ${move.name}! '
+          '$postMashDamage dmg'
+          ' [M5 mash:$m5AttackPresses => +$m5AttackBonus, Flutter block:$flutterBlockPresses => -$flutterBlock]'
+          '${resolved.stunned ? ' and stunned ${_player.displayName}!' : ''}';
+    } else {
+      final mashCount = await _runM5MashChallenge(
+        phase: 'defense',
+        contextName: move.name,
+      );
+      final resolved = await _resolveMove(move, _playerShield);
+      final m5Block = _defenseBlockFromPresses(mashCount);
+      postMashDamage = max(0, resolved.damage - m5Block);
+
+      playerStunnedNext = resolved.stunned;
+      enemyHpNext = min(_enemy.maxHp, _enemyHp + resolved.heal);
+      enemyShieldNext = _enemyShield + resolved.shieldGain;
+      playerShieldNext = max(0, _playerShield - resolved.blocked);
+      enemyTurnStatus =
           '${_enemy.displayName} used ${move.name}! '
           '$postMashDamage dmg'
           '${resolved.blocked > 0 ? ' (${resolved.blocked} blocked)' : ''}'
@@ -725,6 +971,18 @@ class _BattleScreenState extends State<BattleScreen> {
           '${resolved.heal > 0 ? ' +${resolved.heal} HP' : ''}'
           '${resolved.shieldGain > 0 ? ' +${resolved.shieldGain} shield' : ''}'
           '${resolved.stunned ? ' and stunned ${_player.displayName}!' : ''}';
+    }
+
+    setState(() {
+      _playerShield = playerShieldNext;
+      _playerHp = max(0, _playerHp - postMashDamage);
+      _playerStunned = playerStunnedNext;
+      _enemyHp = enemyHpNext;
+      _enemyShield = enemyShieldNext;
+      _playerTurn = true;
+      _isAnimating = false;
+
+      _status = enemyTurnStatus;
 
       if (_playerHp <= 0) {
         _playerPose = CombatantPose.death;
@@ -868,6 +1126,48 @@ class _BattleScreenState extends State<BattleScreen> {
           }
 
           Widget rootLayout() {
+            if (_isPvpMode) {
+              return Column(
+                children: [
+                  Expanded(
+                    child: Row(
+                      children: [
+                        rowButton(
+                          'Attacks',
+                          _canPlayerAct
+                              ? () => setState(
+                                  () => _commandMode = CommandMode.attacks,
+                                )
+                              : null,
+                        ),
+                        SizedBox(width: gap),
+                        rowButton('Run', () {
+                          Navigator.of(context).pushReplacement(
+                            MaterialPageRoute<void>(
+                              builder: (_) => CharacterSelectScreen(
+                                enableHardware: widget.enableHardware,
+                                gameMode: widget.gameMode,
+                              ),
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                  SizedBox(height: gap),
+                  Expanded(
+                    child: Row(
+                      children: [
+                        rowButton('PvP Mash Clash', null),
+                        SizedBox(width: gap),
+                        rowButton('Back and Forth', null),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }
+
             return Column(
               children: [
                 Expanded(
@@ -900,6 +1200,7 @@ class _BattleScreenState extends State<BattleScreen> {
                           MaterialPageRoute<void>(
                             builder: (_) => CharacterSelectScreen(
                               enableHardware: widget.enableHardware,
+                              gameMode: widget.gameMode,
                             ),
                           ),
                         );
@@ -1162,6 +1463,166 @@ class _BattleScreenState extends State<BattleScreen> {
                       ),
                     ),
                   ),
+
+                  if (_showQte)
+                    Positioned.fill(
+                      child: Container(
+                        color: Colors.black.withValues(alpha: 0.55),
+                        child: Center(
+                          child: Container(
+                            width: min(420, constraints.maxWidth * 0.88),
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              border: Border.all(color: Colors.black, width: 3),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Text(
+                                  'Quick Time Event',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                const Text(
+                                  'Tap when the marker is in the green zone',
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 12),
+                                SizedBox(
+                                  height: 44,
+                                  child: LayoutBuilder(
+                                    builder: (context, qteBox) {
+                                      final trackWidth = qteBox.maxWidth;
+                                      final zoneLeft =
+                                          trackWidth * _qteZoneStart;
+                                      final zoneWidth =
+                                          trackWidth *
+                                          (_qteZoneEnd - _qteZoneStart);
+                                      final markerLeft =
+                                          trackWidth * _qteProgress;
+
+                                      return Stack(
+                                        children: [
+                                          Positioned.fill(
+                                            child: Container(
+                                              decoration: BoxDecoration(
+                                                color: Colors.grey.shade200,
+                                                border: Border.all(
+                                                  color: Colors.black54,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          Positioned(
+                                            left: zoneLeft,
+                                            width: zoneWidth,
+                                            top: 0,
+                                            bottom: 0,
+                                            child: Container(
+                                              color: Colors.green.withValues(
+                                                alpha: 0.45,
+                                              ),
+                                            ),
+                                          ),
+                                          Positioned(
+                                            left: markerLeft,
+                                            top: 0,
+                                            bottom: 0,
+                                            child: Container(
+                                              width: 4,
+                                              color: Colors.red.shade700,
+                                            ),
+                                          ),
+                                        ],
+                                      );
+                                    },
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: FilledButton(
+                                    onPressed: _tapQteNow,
+                                    child: const Text('TAP'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  if (_showMashOverlay)
+                    Positioned.fill(
+                      child: Container(
+                        color: Colors.black.withValues(alpha: 0.6),
+                        child: Center(
+                          child: Container(
+                            width: min(430, constraints.maxWidth * 0.9),
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              border: Border.all(color: Colors.black, width: 3),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  _mashLabel,
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  _mashGo
+                                      ? 'GO! Tap as fast as possible'
+                                      : 'READY...',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    color: _mashGo
+                                        ? Colors.green.shade800
+                                        : Colors.orange.shade800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  _mashGo
+                                      ? 'Time left: ${_mashTimeLeftSeconds.toStringAsFixed(1)}s'
+                                      : 'Get set...',
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Presses: $_mashPressCount',
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: FilledButton(
+                                    onPressed: _mashGo ? _tapMashNow : null,
+                                    child: const Text('MASH'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               );
             },
