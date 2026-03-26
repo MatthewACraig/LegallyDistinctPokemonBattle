@@ -8,7 +8,6 @@ import 'package:mqtt_client/mqtt_server_client.dart';
 
 import '../models/battle_move.dart';
 import '../models/fighter_class.dart';
-import '../models/power_up_event.dart';
 import '../services/ble_power_up_source.dart';
 import '../services/mqtt_power_up_source.dart';
 import '../services/power_up_source.dart';
@@ -82,7 +81,7 @@ class _BattleScreenState extends State<BattleScreen> {
   final Random _random = Random();
 
   late final PowerUpSource _powerUpSource;
-  StreamSubscription<PowerUpEvent>? _powerUpSubscription;
+  BlePowerUpSource? _blePowerUpSource;
   late final FighterClassData _player;
   late FighterClassData _enemy;
 
@@ -127,13 +126,15 @@ class _BattleScreenState extends State<BattleScreen> {
     if (!widget.enableHardware) {
       _powerUpSource = NoopPowerUpSource();
     } else if (_useBleTransport) {
-      _powerUpSource = BlePowerUpSource(
+      final source = BlePowerUpSource(
         serviceUuid: _bleServiceUuid,
         powerUpNotifyCharacteristicUuid: _blePowerUpNotifyUuid,
         mobileReadyWriteCharacteristicUuid: _bleMobileReadyWriteUuid,
         preferredDeviceName: _bleDeviceName,
         mobileReadyPayload: 'mobileReady:$_matchId',
       );
+      _blePowerUpSource = source;
+      _powerUpSource = source;
     } else {
       _powerUpSource = MqttPowerUpSource(
         broker: _mqttBroker,
@@ -150,7 +151,6 @@ class _BattleScreenState extends State<BattleScreen> {
 
   @override
   void dispose() {
-    _powerUpSubscription?.cancel();
     _matchReadyTimeout?.cancel();
     _matchClient?.disconnect();
     _powerUpSource.dispose();
@@ -159,7 +159,6 @@ class _BattleScreenState extends State<BattleScreen> {
 
   Future<void> _setupPowerUps() async {
     await _powerUpSource.connect();
-    _powerUpSubscription = _powerUpSource.events.listen(_applyPowerUp);
   }
 
   Future<void> _setupMatchListener() async {
@@ -317,24 +316,24 @@ class _BattleScreenState extends State<BattleScreen> {
   bool get _canPlayerAct =>
       _playerTurn && !_isBattleOver && !_isAnimating && _isM5Ready;
 
-  void _applyPowerUp(PowerUpEvent event) {
-    if (!mounted || _isBattleOver) {
-      return;
+  int _attackBonusFromPresses(int pressCount) => min(30, pressCount ~/ 2);
+
+  int _defenseBlockFromPresses(int pressCount) => min(30, pressCount ~/ 2);
+
+  Future<int> _runM5MashChallenge({
+    required String phase,
+    required String contextName,
+  }) async {
+    if (!_useBleTransport || _blePowerUpSource == null || !_isM5Ready) {
+      return 0;
     }
 
     setState(() {
-      switch (event.type) {
-        case PowerUpType.heal:
-          _playerHp = min(_player.maxHp, _playerHp + 15);
-          _status = 'M5 Power-Up: Heal +15 HP!';
-        case PowerUpType.shield:
-          _playerShield += 8;
-          _status = 'M5 Power-Up: Shield +8!';
-        case PowerUpType.boost:
-          _hasBoost = true;
-          _status = 'M5 Power-Up: Next attack gets +8 damage!';
-      }
+      _status =
+          'M5 turn: ${phase == 'attack' ? 'Attack assist' : 'Defense assist'} for $contextName...';
     });
+
+    return _blePowerUpSource!.runChallenge(matchId: _matchId, phase: phase);
   }
 
   String _pickImpactVfx() => _impactVfx[_random.nextInt(_impactVfx.length)];
@@ -613,9 +612,14 @@ class _BattleScreenState extends State<BattleScreen> {
       );
     }
 
+    final mashCount = await _runM5MashChallenge(
+      phase: 'attack',
+      contextName: move.name,
+    );
     final resolved = await _resolveMove(move, _enemyShield);
     final boost = _hasBoost ? 8 : 0;
-    final totalDamage = resolved.damage + boost;
+    final m5Bonus = _attackBonusFromPresses(mashCount);
+    final totalDamage = resolved.damage + boost + m5Bonus;
 
     setState(() {
       _enemyShield = max(0, _enemyShield - resolved.blocked);
@@ -634,7 +638,8 @@ class _BattleScreenState extends State<BattleScreen> {
           '${resolved.doubleStrike ? ' [DOUBLE]' : ''}'
           '${resolved.heal > 0 ? ' +${resolved.heal} HP' : ''}'
           '${resolved.shieldGain > 0 ? ' +${resolved.shieldGain} shield' : ''}'
-          '${resolved.stunned ? ' and stunned ${_enemy.displayName}!' : ''}';
+          '${resolved.stunned ? ' and stunned ${_enemy.displayName}!' : ''}'
+          '${m5Bonus > 0 ? ' [M5 +$m5Bonus from $mashCount presses]' : ''}';
     });
 
     await _playCenterVfx(_impactForMove(_player, move));
@@ -693,11 +698,17 @@ class _BattleScreenState extends State<BattleScreen> {
       );
     }
 
+    final mashCount = await _runM5MashChallenge(
+      phase: 'defense',
+      contextName: move.name,
+    );
     final resolved = await _resolveMove(move, _playerShield);
+    final m5Block = _defenseBlockFromPresses(mashCount);
+    final postMashDamage = max(0, resolved.damage - m5Block);
 
     setState(() {
       _playerShield = max(0, _playerShield - resolved.blocked);
-      _playerHp = max(0, _playerHp - resolved.damage);
+      _playerHp = max(0, _playerHp - postMashDamage);
       _playerStunned = resolved.stunned;
       _enemyHp = min(_enemy.maxHp, _enemyHp + resolved.heal);
       _enemyShield += resolved.shieldGain;
@@ -706,8 +717,9 @@ class _BattleScreenState extends State<BattleScreen> {
 
       _status =
           '${_enemy.displayName} used ${move.name}! '
-          '${resolved.damage} dmg'
+          '$postMashDamage dmg'
           '${resolved.blocked > 0 ? ' (${resolved.blocked} blocked)' : ''}'
+          '${m5Block > 0 ? ' ($m5Block M5 block)' : ''}'
           '${resolved.critical ? ' [CRIT]' : ''}'
           '${resolved.doubleStrike ? ' [DOUBLE]' : ''}'
           '${resolved.heal > 0 ? ' +${resolved.heal} HP' : ''}'
@@ -755,15 +767,6 @@ class _BattleScreenState extends State<BattleScreen> {
     Future<void>.delayed(const Duration(milliseconds: 500), () {
       _enemyTurn();
     });
-  }
-
-  void _triggerM5PowerUp() {
-    if (!_canPlayerAct) {
-      return;
-    }
-
-    final drop = PowerUpType.values[_random.nextInt(PowerUpType.values.length)];
-    _applyPowerUp(PowerUpEvent(drop));
   }
 
   Widget _buildHudBox({
@@ -890,10 +893,7 @@ class _BattleScreenState extends State<BattleScreen> {
                 Expanded(
                   child: Row(
                     children: [
-                      rowButton(
-                        'M5 Powerup',
-                        _canPlayerAct ? _triggerM5PowerUp : null,
-                      ),
+                      rowButton('M5 QTE (auto each turn)', null),
                       SizedBox(width: gap),
                       rowButton('Run', () {
                         Navigator.of(context).pushReplacement(

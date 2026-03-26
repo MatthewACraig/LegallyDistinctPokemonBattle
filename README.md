@@ -47,7 +47,10 @@ Run with:
 flutter run --dart-define=POWERUP_TRANSPORT=ble
 ```
 
-The BLE transport listens for power-up notifications from an M5 BLE server named `EGR425_BLE_Tag_Server`.
+The BLE transport runs M5 challenge phases from an M5 BLE server named `EGR425_BLE_Tag_Server`:
+- `READY` (1 second)
+- `GO!` (4 seconds of A/B/C mashing)
+- Flutter uses press count for attack bonus or defense block
 
 ## M5 Core2 setup
 Firmware lives at:

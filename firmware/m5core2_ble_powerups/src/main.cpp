@@ -16,6 +16,17 @@ BLECharacteristic* mobileReadyWriteCharacteristic = nullptr;
 bool deviceConnected = false;
 bool clientSubscribed = false;
 String activeMatchId = "";
+bool challengeActive = false;
+bool challengeGo = false;
+String challengePhase = "";
+String challengeRequestId = "";
+int challengePressCount = 0;
+unsigned long challengeStartMs = 0;
+unsigned long challengeGoMs = 0;
+unsigned long lastHudRefreshMs = 0;
+
+static const unsigned long READY_MS = 1000;
+static const unsigned long CHALLENGE_MS = 4000;
 
 void drawStatus(const String& line1, const String& line2 = "", const String& line3 = "") {
   M5.Lcd.fillScreen(BLACK);
@@ -57,26 +68,105 @@ class ServerCallbacks : public BLEServerCallbacks {
     deviceConnected = false;
     clientSubscribed = false;
     activeMatchId = "";
+    challengeActive = false;
+    challengeGo = false;
     drawStatus("Client disconnected", "Advertising...");
     restartAdvertising();
   }
 };
 
-class MobileReadyCallbacks : public BLECharacteristicCallbacks {
+String tokenAt(const String& input, int tokenIndex) {
+  int start = 0;
+  int current = 0;
+
+  while (start <= input.length()) {
+    int end = input.indexOf('|', start);
+    if (end < 0) {
+      end = input.length();
+    }
+    if (current == tokenIndex) {
+      return input.substring(start, end);
+    }
+    if (end >= input.length()) {
+      break;
+    }
+    start = end + 1;
+    current++;
+  }
+
+  return "";
+}
+
+void startChallenge(const String& phase, const String& requestId) {
+  challengeActive = true;
+  challengeGo = false;
+  challengePhase = phase;
+  challengeRequestId = requestId;
+  challengePressCount = 0;
+  challengeStartMs = millis();
+  challengeGoMs = 0;
+  lastHudRefreshMs = 0;
+  drawStatus("M5 turn incoming", "READY", "Get ready to mash A/B/C");
+}
+
+void sendChallengeResult() {
+  if (!deviceConnected || powerUpNotifyCharacteristic == nullptr) {
+    return;
+  }
+
+  String payload = "{\"type\":\"challengeResult\",\"matchId\":\"" + activeMatchId +
+                   "\",\"phase\":\"" + challengePhase + "\",\"requestId\":\"" + challengeRequestId +
+                   "\",\"count\":" + String(challengePressCount) + "}";
+  powerUpNotifyCharacteristic->setValue(payload.c_str());
+  powerUpNotifyCharacteristic->notify();
+
+  drawStatus("Result sent",
+             "Phase: " + challengePhase,
+             "Presses: " + String(challengePressCount));
+}
+
+class MobileCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) override {
     String value = pCharacteristic->getValue().c_str();
     value.trim();
+
     if (value.startsWith("mobileReady:")) {
       activeMatchId = value.substring(String("mobileReady:").length());
-    } else {
-      activeMatchId = value;
+      if (activeMatchId.length() == 0) {
+        activeMatchId = "local";
+      }
+      drawStatus("Ready", "Match: " + activeMatchId, "Waiting for challenge...");
+      return;
     }
 
+    if (!value.startsWith("challenge|start|")) {
+      return;
+    }
+
+    const String command = tokenAt(value, 0);
+    const String action = tokenAt(value, 1);
+    const String phase = tokenAt(value, 2);
+    const String requestId = tokenAt(value, 3);
+    const String matchId = tokenAt(value, 4);
+
+    if (command != "challenge" || action != "start") {
+      return;
+    }
+    if (phase != "attack" && phase != "defense") {
+      return;
+    }
+    if (requestId.length() == 0) {
+      return;
+    }
+
+    if (matchId.length() > 0) {
+      activeMatchId = matchId;
+    }
     if (activeMatchId.length() == 0) {
       activeMatchId = "local";
     }
 
-    drawStatus("Ready", "Match: " + activeMatchId, "A=heal B=shield C=boost");
+    startChallenge(phase, requestId);
   }
 
   void onStatus(BLECharacteristic* pCharacteristic, Status s, uint32_t code) override {
@@ -90,29 +180,6 @@ class MobileReadyCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-void sendPowerUp(const char* powerUp) {
-  if (!deviceConnected || powerUpNotifyCharacteristic == nullptr) {
-    drawStatus("Not connected", "Reconnect mobile BLE client");
-    return;
-  }
-
-  if (activeMatchId.length() == 0) {
-    drawStatus("No match id", "Waiting for mobileReady write");
-    return;
-  }
-
-  String payload = "{\"type\":\"powerUp\",\"matchId\":\"" + activeMatchId +
-                   "\",\"powerUp\":\"" + String(powerUp) + "\",\"player\":\"m5core2\"}";
-  powerUpNotifyCharacteristic->setValue(payload.c_str());
-  powerUpNotifyCharacteristic->notify();
-
-  String line2 = "Match: " + activeMatchId;
-  if (!clientSubscribed) {
-    line2 += " (notify pending)";
-  }
-  drawStatus("Sent power-up", line2, String("Power-up: ") + powerUp);
-}
-
 void setupBleServer() {
   BLEDevice::init(SERVER_NAME);
   bleServer = BLEDevice::createServer();
@@ -123,13 +190,13 @@ void setupBleServer() {
       POWERUP_NOTIFY_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE);
   powerUpNotifyCharacteristic->addDescriptor(new BLE2902());
-  powerUpNotifyCharacteristic->setCallbacks(new MobileReadyCallbacks());
+  powerUpNotifyCharacteristic->setCallbacks(new MobileCallbacks());
   powerUpNotifyCharacteristic->setValue("{\"powerUp\":\"heal\"}");
 
   mobileReadyWriteCharacteristic = service->createCharacteristic(
       MOBILE_READY_WRITE_UUID,
       BLECharacteristic::PROPERTY_WRITE);
-  mobileReadyWriteCharacteristic->setCallbacks(new MobileReadyCallbacks());
+  mobileReadyWriteCharacteristic->setCallbacks(new MobileCallbacks());
   mobileReadyWriteCharacteristic->setValue("mobileReady");
 
   service->start();
@@ -147,15 +214,42 @@ void setup() {
 void loop() {
   M5.update();
 
-  if (activeMatchId.length() > 0) {
+  if (challengeActive) {
+    const unsigned long now = millis();
+
+    if (!challengeGo) {
+      if (now - challengeStartMs >= READY_MS) {
+        challengeGo = true;
+        challengeGoMs = now;
+        drawStatus("GO!", "Mash A / B / C", "Time: 4.0s");
+      }
+      delay(10);
+      return;
+    }
+
     if (M5.BtnA.wasPressed()) {
-      sendPowerUp("heal");
+      challengePressCount++;
     }
     if (M5.BtnB.wasPressed()) {
-      sendPowerUp("shield");
+      challengePressCount++;
     }
     if (M5.BtnC.wasPressed()) {
-      sendPowerUp("boost");
+      challengePressCount++;
+    }
+
+    const unsigned long elapsed = now - challengeGoMs;
+    if (now - lastHudRefreshMs > 120) {
+      lastHudRefreshMs = now;
+      const int remainingMs = (int)max((long)0, (long)CHALLENGE_MS - (long)elapsed);
+      String line2 = "Presses: " + String(challengePressCount);
+      String line3 = "Time: " + String(remainingMs / 1000.0f, 1) + "s";
+      drawStatus("GO!", line2, line3);
+    }
+
+    if (elapsed >= CHALLENGE_MS) {
+      challengeActive = false;
+      sendChallengeResult();
+      drawStatus("Ready", "Match: " + activeMatchId, "Waiting for challenge...");
     }
   }
 

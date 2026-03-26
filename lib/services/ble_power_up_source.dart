@@ -35,6 +35,8 @@ class BlePowerUpSource implements PowerUpSource {
   bool _disposed = false;
   bool _isScanning = false;
   Timer? _retryTimer;
+  int _requestCounter = 0;
+  final Map<String, Completer<int>> _pendingChallengeResults = {};
 
   @override
   Stream<PowerUpEvent> get events => _controller.stream;
@@ -146,7 +148,12 @@ class BlePowerUpSource implements PowerUpSource {
     _notifySubscription = _powerUpNotifyCharacteristic!.lastValueStream.listen((
       value,
     ) {
-      final event = _tryParsePowerUp(utf8.decode(value, allowMalformed: true));
+      final payload = utf8.decode(value, allowMalformed: true);
+      if (_tryHandleChallengeResult(payload)) {
+        return;
+      }
+
+      final event = _tryParsePowerUp(payload);
       if (event != null) {
         _controller.add(event);
       }
@@ -189,6 +196,75 @@ class BlePowerUpSource implements PowerUpSource {
     return PowerUpEvent.fromPayload(payload.trim());
   }
 
+  bool _tryHandleChallengeResult(String payload) {
+    try {
+      final decoded = jsonDecode(payload);
+      if (decoded is! Map<String, dynamic> ||
+          decoded['type'] != 'challengeResult') {
+        return false;
+      }
+
+      final requestId = decoded['requestId'];
+      final countRaw = decoded['count'];
+      if (requestId is! String || countRaw is! num) {
+        return false;
+      }
+
+      final completer = _pendingChallengeResults.remove(requestId);
+      completer?.complete(countRaw.toInt());
+      return completer != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<int> runChallenge({
+    required String matchId,
+    required String phase,
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final writeCharacteristic = _mobileReadyWriteCharacteristic;
+    if (writeCharacteristic == null) {
+      return 0;
+    }
+
+    final requestId =
+        'r${DateTime.now().millisecondsSinceEpoch}_${_requestCounter++}';
+    final completer = Completer<int>();
+    _pendingChallengeResults[requestId] = completer;
+
+    final payload = 'challenge|start|$phase|$requestId|$matchId';
+    try {
+      final supportsWrite = writeCharacteristic.properties.write;
+      final supportsWriteWithoutResponse =
+          writeCharacteristic.properties.writeWithoutResponse;
+
+      if (supportsWrite) {
+        await writeCharacteristic.write(
+          utf8.encode(payload),
+          withoutResponse: false,
+        );
+      } else if (supportsWriteWithoutResponse) {
+        await writeCharacteristic.write(
+          utf8.encode(payload),
+          withoutResponse: true,
+        );
+      } else {
+        await writeCharacteristic.write(utf8.encode(payload));
+      }
+    } catch (_) {
+      _pendingChallengeResults.remove(requestId);
+      return 0;
+    }
+
+    try {
+      return await completer.future.timeout(timeout);
+    } catch (_) {
+      _pendingChallengeResults.remove(requestId);
+      return 0;
+    }
+  }
+
   void _cleanupConnectionState() {
     _powerUpNotifyCharacteristic = null;
     _mobileReadyWriteCharacteristic = null;
@@ -226,6 +302,12 @@ class BlePowerUpSource implements PowerUpSource {
         await _device!.disconnect();
       } catch (_) {}
     }
+    for (final completer in _pendingChallengeResults.values) {
+      if (!completer.isCompleted) {
+        completer.complete(0);
+      }
+    }
+    _pendingChallengeResults.clear();
     await _controller.close();
   }
 }
