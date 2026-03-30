@@ -13,7 +13,7 @@ import '../services/ble_power_up_source.dart';
 import '../services/mqtt_power_up_source.dart';
 import '../services/power_up_source.dart';
 import '../widgets/sprite_sheet_actor.dart';
-import 'character_select_screen.dart';
+import 'game_mode_screen.dart';
 
 class BattleScreen extends StatefulWidget {
   const BattleScreen({
@@ -1144,9 +1144,8 @@ class _BattleScreenState extends State<BattleScreen> {
                         rowButton('Run', () {
                           Navigator.of(context).pushReplacement(
                             MaterialPageRoute<void>(
-                              builder: (_) => CharacterSelectScreen(
+                              builder: (_) => GameModeScreen(
                                 enableHardware: widget.enableHardware,
-                                gameMode: widget.gameMode,
                               ),
                             ),
                           );
@@ -1198,9 +1197,8 @@ class _BattleScreenState extends State<BattleScreen> {
                       rowButton('Run', () {
                         Navigator.of(context).pushReplacement(
                           MaterialPageRoute<void>(
-                            builder: (_) => CharacterSelectScreen(
+                            builder: (_) => GameModeScreen(
                               enableHardware: widget.enableHardware,
-                              gameMode: widget.gameMode,
                             ),
                           ),
                         );
